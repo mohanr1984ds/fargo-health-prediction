@@ -1,0 +1,291 @@
+---
+title: "Final Project - Part 1"
+author: "Mohan Rajendran"
+date: "November 23, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load necessary libraries here.
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(magrittr)
+library(dplyr)
+library(readr)
+library(ggformula)
+library(stringr)
+library(readxl)
+library(mice)
+library(Amelia)
+library(aTSA)
+library(forecast)
+library(Hmisc)
+set.seed(123)
+```
+
+Read the Excel data into individual data frames
+```{r}
+
+Abbeville_Raw <- read_xlsx("Dataset.xlsx", sheet = 2, skip = 1, col_names = c('IncomingExaminations', 'Year', 'Month'))
+Violet_df <- read_xlsx("Dataset.xlsx", sheet = 3, skip = 1, col_names = c('OriginalHospitalLocation',	'Examination',	'Date',	'RequestID'))
+NewOrleans_df <- read_xlsx("Dataset.xlsx", sheet = 4, skip = 1, col_names = c('OriginalHospitalLocation',	'Examination',	'Date',	'RequestID'))
+Lafayette_df <- read_xlsx("Dataset.xlsx", sheet = 5, skip = 1, col_names = c('OriginalHospitalLocation',	'Examination',	'Date',	'RequestID'))
+BatonRougue_df <- read_xlsx("Dataset.xlsx", sheet = 6, skip = 1, col_names = c('OriginalHospitalLocation',	'Examination',	'Date',	'RequestID'))
+Dec2013_df <- read_xlsx("Dataset.xlsx", sheet = 7, skip = 1, col_names = c('RoutingSysId'))
+HeartConditionCodes_df <- read_xlsx("Dataset.xlsx", sheet = 8, skip = 1, col_names = c('Condition', 'ConditionCode'))
+ConditionCodeMap_df <- read_xlsx("Dataset.xlsx", sheet = 9, skip = 1, col_names = c('Condition', 'ConditionCode'))
+CardiovascularLookup_df <- read_xlsx("Cardiovascular Lookup.xlsx", sheet = 1, skip = 1, col_names = c('Examination'))
+
+```
+
+CleanData function that takes dataframe and a name to compute cleaneddata for Neighboring HC datasets
+```{r}
+
+CleanData <- function(df, HName){
+  if (HName != 'NewOrleans'){
+  df <- df %>%
+    filter(OriginalHospitalLocation == "Abbeville") %>%
+    inner_join(CardiovascularLookup_df, by = "Examination") %>%
+    mutate(ModifiedDate = as.Date(ifelse(!is.na(as.Date((as.numeric(Date)), origin = "1899-12-30")), as.Date((as.numeric(Date)), origin = "1899-12-30"),as.Date(Date, format = "%d %B, %Y")), origin = "1970-01-01"))  %>%
+    mutate(year = format(ModifiedDate,'%Y'),
+         month = format(ModifiedDate,'%m'),
+         day = format(ModifiedDate,'%d'),
+         HospitalCustomId = HName)
+  } else {
+    df$Date <- as.Date(round(df$Date))
+    df <- df %>%
+    filter(OriginalHospitalLocation == "Abbeville") %>%
+    inner_join(CardiovascularLookup_df, by = "Examination") %>%
+    mutate(ModifiedDate = Date)  %>%
+    mutate(year = format(ModifiedDate,'%Y'),
+         month = format(ModifiedDate,'%m'),
+         day = format(ModifiedDate,'%d'),
+         HospitalCustomId = HName)
+  }
+  
+  return(df)
+  
+}
+
+```
+
+
+Apply the function to all the HCs datasets.
+```{r}
+Violet_df <- CleanData(Violet_df, 'Violet')
+##View(Violet_df)
+Lafayette_df <- CleanData(Lafayette_df, 'Lafayette')
+##View(Lafayette_df)
+NewOrleans_df <- CleanData(NewOrleans_df, 'NewOrleans')
+##View(NewOrleans_df)
+BatonRougue_df <- CleanData(BatonRougue_df, 'BatonRougue')
+##View(BatonRougue_df)
+
+```
+
+
+Combine the datasets to create one dataframe which can be used in later analysis
+```{r}
+CleanNeighbourHC_df <- rbind(Violet_df, NewOrleans_df, Lafayette_df, BatonRougue_df)  %>%  unique()
+##View(CleanNeighbourHC_df)
+
+```
+
+
+Filter the Dec2013 dataframe for Abbeville HC and Cardiovascular diseases
+```{r}
+
+Dec2013_df1 <- Dec2013_df  %>%
+  mutate(LocationCustomId = str_c(substring(RoutingSysId, 1, 4), substring(RoutingSysId, 14, 17)),
+         ConditionCode = substring(RoutingSysId, 8, 13))  %>%
+  filter(LocationCustomId  %in% c("L839TGU3", "L839ROV8"))  %>%
+  inner_join(HeartConditionCodes_df, by = "ConditionCode")  %>%
+  unique()
+##View(Dec2013_df1)
+
+```
+
+
+Add monthstartdate to the Abbeville df and sort the df based on the monthstartdate column
+```{r}
+Abbeville_df <- Abbeville_Raw
+Abbeville_df <- Abbeville_df   %>%
+  mutate(MonthStartDate = as.Date(str_c(Year,'/',Month,'/','1'), format = "%Y/%m/%d"))
+
+Abbeville_df$Year <- as.factor(Abbeville_df$Year)
+Abbeville_df <- Abbeville_df[order(Abbeville_df$MonthStartDate), ]
+```
+ 
+
+Perform the below data cleaning activities
+1.	First, NA is assigned to invalid such as * and other character values and missing values in Incoming Examinations column and then the column is converted to numeric data type. Also the starting date of the year month combination in each row is added as a new date column. This column is used to sort the dataframe.
+2.	Next, the aggregate value of 5129 is split and assigned for Dec 2009 to Feb 2010 by taking approximate average as follows
+    a.	Dec2009 – 1709
+    b.	Jan 2010 & Feb 2010 – 1710 each
+3.	The next step is assign NA to the outliers in the data represented by 99999999, 9999999 and for the Oct 2008 when the HC received unusual number of request due to neighbor HC being closed.
+4.	Lastly, we will correct the partial data being displayed for May 2007, May 2013, June 2013, July 2013, Dec 2013 by adding the existing value with the count of the rerouted entries in the combined Neighboring dataframe and the Dec2013 dataframe.
+
+```{r} 
+Abbeville_df$IncomingExaminations[which(is.na(as.numeric(Abbeville_df$IncomingExaminations))) ] <- NA
+Abbeville_df$IncomingExaminations <- as.numeric((Abbeville_df$IncomingExaminations))
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2009 & Abbeville_df$Month == 12)] <- 1477
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2010 & Abbeville_df$Month == 1)] <- 1809
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2010 & Abbeville_df$Month == 2)] <- 1843
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2008 & Abbeville_df$Month == 10)] <- NA
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2008 & Abbeville_df$Month == 12)] <- NA
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2011 & Abbeville_df$Month == 1)] <- NA
+
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2007 & Abbeville_df$Month == 05)] <- unlist(Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2007 & Abbeville_df$Month == 05)] + CleanNeighbourHC_df %>%
+  filter(year == '2007' & month == '05' & day == '02') %>%
+  summarise(total = n()))
+
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2013 & Abbeville_df$Month == 12)] <- unlist(Dec2013_df1 %>%
+  summarise(total = n()))
+
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2013 & Abbeville_df$Month == 05)] <- unlist(Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2013 & Abbeville_df$Month == 05)] + CleanNeighbourHC_df %>%
+  filter(year == '2013' & month == '05') %>%
+  summarise(total = n()))
+
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2013 & Abbeville_df$Month == 06)] <- unlist(Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2013 & Abbeville_df$Month == 06)] + CleanNeighbourHC_df %>%
+  filter(year == '2013' & month == '06') %>%
+  summarise(total = n()))
+
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2013 & Abbeville_df$Month == 07)] <- unlist(Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2013 & Abbeville_df$Month == 07)] + CleanNeighbourHC_df %>%
+  filter(year == '2013' & month == '07') %>%
+  summarise(total = n()))
+
+
+##View(Abbeville_df)
+
+
+```
+
+
+Plot the yearwise dot plot with 99% confidence interval and box plots to analyse the outliers and seasonality
+```{r}
+summary(Abbeville_df)
+ggplot(Abbeville_df, aes(x=MonthStartDate, y=IncomingExaminations, color = Year)) + geom_point() +  geom_smooth(method=lm, level=.99)
+ggplot(Abbeville_df, aes(x=Year, y=IncomingExaminations)) + geom_boxplot() + facet_wrap(~Year, scale="free")
+ggplot(data=Abbeville_df, aes(x=Month, y=IncomingExaminations, group=Year, color = Year)) +  geom_line() +  geom_point() + scale_x_discrete(breaks = Abbeville_df$Month, labels = Abbeville_df$Month)+  geom_smooth(method=lm)+ facet_wrap(~Year, scale="free")
+ggplot(data=Abbeville_df, aes(x=Month, y=IncomingExaminations, group=Year, color = Year)) +  geom_line() +  geom_point() + scale_x_continuous(breaks = Abbeville_df$Month, labels = Abbeville_df$Month)
+
+```
+
+
+Based on the above plots set the May 2007, Aug 2009 and Jul 2010 to NA as outliers
+```{r}
+
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2007 & Abbeville_df$Month == 5)] <- NA
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2009 & Abbeville_df$Month == 8)] <- NA
+Abbeville_df$IncomingExaminations[which(Abbeville_df$Year == 2010 & Abbeville_df$Month == 7)] <- NA
+summary(Abbeville_df)
+ggplot(Abbeville_df, aes(x=MonthStartDate, y=IncomingExaminations, color = Year)) + geom_point() +  geom_smooth(method=lm, level=.99)
+ggplot(Abbeville_df, aes(x=Year, y=IncomingExaminations)) + geom_boxplot() + facet_wrap(~Year, scale="free")
+ggplot(data=Abbeville_df, aes(x=Month, y=IncomingExaminations, group=Year, color = Year)) +  geom_line() +  geom_point() + scale_x_discrete(breaks = Abbeville_df$Month, labels = Abbeville_df$Month)+  geom_smooth(method=lm)+ facet_wrap(~Year, scale="free")
+ggplot(data=Abbeville_df, aes(x=MonthStartDate, y=IncomingExaminations, group=Year, color = Year)) +  geom_line() +  geom_point() 
+
+```
+
+
+Analyze the missing values for imputting
+```{r}
+
+md.pattern(Abbeville_df)
+missmap(Abbeville_df, col=c('grey', 'steelblue'), y.cex=0.5, x.cex=0.8)
+
+```
+
+
+Perform missing values imputting using MICE and Amelia
+```{r}
+ImpPMMMethod <- mice(Abbeville_df, m=1, method='pmm', printFlag=FALSE)
+ImpCartMethod <- mice(Abbeville_df, m=1, method='cart', printFlag=FALSE)
+ImpAmeliaMethod = amelia( Abbeville_df,  idvars = c("Year", "Month"), m = 1, parallel = 'multicore' )
+#RMSE(ImpPMMMethod)
+
+
+```
+
+
+Plot the density plots and xyplots to identify the best imputing method
+```{r}
+
+xyplot(ImpPMMMethod, IncomingExaminations ~ MonthStartDate)
+densityplot(ImpPMMMethod)
+xyplot(ImpCartMethod, IncomingExaminations ~ MonthStartDate)
+densityplot(ImpCartMethod)
+plot(ImpAmeliaMethod, which.vars = 1:1)
+
+```
+
+
+Plot the xyplt and strip plot for the MICE ppm method which seems better fit
+```{r}
+
+xyplot(ImpPMMMethod, IncomingExaminations ~ MonthStartDate | .imp, pch = 20, cex = 1.4)
+stripplot(ImpPMMMethod, pch = 20, cex = 1.2)
+
+```
+
+
+COmplete the missing values imputation process
+```{r}
+Abbeville_df_bk <- Abbeville_df
+Abbeville_df <- complete(ImpPMMMethod,1)
+write_csv(Abbeville_df, path = "Abbeville_Cleaned.csv")
+```
+
+
+COmpute the Timeseries and plot the decompose plot
+```{r}
+TS_Abbeville_df <- ts (Abbeville_df$IncomingExaminations, frequency = 12, start = 2006) 
+decomposedRes <- decompose(TS_Abbeville_df, type="additive")
+plot(decomposedRes)
+
+```
+
+
+Perform ADF test to test the TS for stationary property
+```{r}
+adf.test(TS_Abbeville_df)
+plot(TS_Abbeville_df)
+
+```
+
+
+Build the HoltzWInter model and compute the accuracy of the model along with AIC
+```{r}
+HoltzWinterModel <- hw(TS_Abbeville_df, initial = "optimal", h=12)
+plot(HoltzWinterModel)
+accuracy(HoltzWinterModel)
+paste('AIC = ',AIC(HoltzWinterModel$model))
+```
+
+
+Make the model non stationary
+```{r}
+TS_Abbeville_df1 <- diff(TS_Abbeville_df, differences=1)
+plot.ts(TS_Abbeville_df1)
+acf(TS_Abbeville_df1, lag.max=20)  
+pacf(TS_Abbeville_df1, lag.max=20)  
+
+```
+
+
+COmpute the ARIMA model and compute its accuracy along with AIC
+```{r}
+autoArimaFit <- arima(TS_Abbeville_df1, c(0,1,0))
+plot(forecast(autoArimaFit, h=12))
+accuracy(autoArimaFit)
+paste('AIC = ',AIC(autoArimaFit))
+```
+
+Holtz WInter model appears to have better AIC and MPE values and its forecasted values are as follows
+```{r}
+nextYearPrediction <- forecast(HoltzWinterModel, h=12)
+nextYearPrediction
+```
+
